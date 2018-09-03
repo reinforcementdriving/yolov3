@@ -5,7 +5,6 @@ from utils.datasets import *
 from utils.utils import *
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-epochs', type=int, default=200, help='number of epochs')
 parser.add_argument('-batch_size', type=int, default=32, help='size of each image batch')
 parser.add_argument('-cfg', type=str, default='cfg/yolov3.cfg', help='path to model config file')
 parser.add_argument('-data_config_path', type=str, default='cfg/coco.data', help='path to data config file')
@@ -23,31 +22,31 @@ print(opt)
 cuda = torch.cuda.is_available() and opt.use_cuda
 device = torch.device('cuda:0' if cuda else 'cpu')
 
-# Get data configuration
+# Configure run
 data_config = parse_data_config(opt.data_config_path)
-test_path = data_config['valid']
 num_classes = int(data_config['classes'])
+if platform == 'darwin':  # MacOS (local)
+    test_path = data_config['valid']
+else:  # linux (cloud, i.e. gcp)
+    test_path = '../coco/5k.part'
 
 # Initiate model
 model = Darknet(opt.cfg, opt.img_size)
 
 # Load weights
-weights_path = 'checkpoints/yolov3.weights'
-if weights_path.endswith('.weights'):  # darknet format
-    load_weights(model, weights_path)
-elif weights_path.endswith('.pt'):  # pytorch format
-    checkpoint = torch.load(weights_path, map_location='cpu')
+if opt.weights_path.endswith('.weights'):  # darknet format
+    load_weights(model, opt.weights_path)
+elif opt.weights_path.endswith('.pt'):  # pytorch format
+    checkpoint = torch.load(opt.weights_path, map_location='cpu')
     model.load_state_dict(checkpoint['model'])
     del checkpoint
 
 model.to(device).eval()
 
 # Get dataloader
-# dataset = ListDataset(test_path)
+# dataset = load_images_with_labels(test_path)
 # dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batch_size, shuffle=False, num_workers=opt.n_cpu)
-dataloader = ListDataset(test_path, batch_size=opt.batch_size, img_size=opt.img_size)
-
-Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
+dataloader = load_images_and_labels(test_path, batch_size=opt.batch_size, img_size=opt.img_size)
 
 n_gt = 0
 correct = 0
@@ -87,11 +86,7 @@ for batch_i, (imgs, targets) in enumerate(dataloader):
             correct.extend([0 for _ in range(len(detections))])
         else:
             # Extract target boxes as (x1, y1, x2, y2)
-            target_boxes = torch.FloatTensor(annotations[:, 1:].shape)
-            target_boxes[:, 0] = (annotations[:, 1] - annotations[:, 3] / 2)
-            target_boxes[:, 1] = (annotations[:, 2] - annotations[:, 4] / 2)
-            target_boxes[:, 2] = (annotations[:, 1] + annotations[:, 3] / 2)
-            target_boxes[:, 3] = (annotations[:, 2] + annotations[:, 4] / 2)
+            target_boxes = xywh2xyxy(annotations[:, 1:5])
             target_boxes *= opt.img_size
 
             detected = []

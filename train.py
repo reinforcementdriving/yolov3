@@ -33,16 +33,16 @@ def main(opt):
     # Configure run
     data_config = parse_data_config(opt.data_config_path)
     num_classes = int(data_config['classes'])
-    if platform == 'darwin':  # macos
-        train_path = data_config['valid']
-    else:  # linux (gcp cloud)
+    if platform == 'darwin':  # MacOS (local)
+        train_path = data_config['train']
+    else:  # linux (cloud, i.e. gcp)
         train_path = '../coco/trainvalno5k.part'
 
     # Initialize model
     model = Darknet(opt.cfg, opt.img_size)
 
     # Get dataloader
-    dataloader = ListDataset(train_path, batch_size=opt.batch_size, img_size=opt.img_size)
+    dataloader = load_images_and_labels(train_path, batch_size=opt.batch_size, img_size=opt.img_size, augment=True)
 
     # reload saved optimizer state
     start_epoch = 0
@@ -65,7 +65,7 @@ def main(opt):
         #         p.requires_grad = False
 
         # Set optimizer
-        # optimizer = torch.optim.SGD(model.parameters(), lr=.001, momentum=.9, weight_decay=0.0005 * 0, nesterov=True)
+        # optimizer = torch.optim.SGD(model.parameters(), lr=.001, momentum=.9, weight_decay=5e-4, nesterov=True)
         # optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()))
         optimizer = torch.optim.Adam(model.parameters())
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -93,9 +93,10 @@ def main(opt):
     for epoch in range(opt.epochs):
         epoch += start_epoch
 
+        # Multi-Scale Training
         # img_size = random.choice(range(10, 20)) * 32
-        # dataloader = ListDataset(train_path, batch_size=opt.batch_size, img_size=img_size)
-        # print('Running image size %g' % img_size)
+        # dataloader = load_images_and_labels(train_path, batch_size=opt.batch_size, img_size=img_size, augment=True)
+        # print('Running this epoch with image size %g' % img_size)
 
         # Update scheduler
         # if epoch % 25 == 0:
