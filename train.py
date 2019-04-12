@@ -1,193 +1,244 @@
 import argparse
 import time
 
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+
+import test  # Import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
 from utils.utils import *
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-epochs', type=int, default=160, help='number of epochs')
-parser.add_argument('-batch_size', type=int, default=12, help='size of each image batch')
-parser.add_argument('-data_config_path', type=str, default='cfg/coco.data', help='data config file path')
-parser.add_argument('-cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
-parser.add_argument('-img_size', type=int, default=32 * 13, help='size of each image dimension')
-parser.add_argument('-resume', default=False, help='resume training flag')
-opt = parser.parse_args()
-print(opt)
 
-cuda = torch.cuda.is_available()
-device = torch.device('cuda:0' if cuda else 'cpu')
+def train(
+        cfg,
+        data_cfg,
+        img_size=416,
+        resume=False,
+        epochs=273,  # 500200 batches at bs 64, dataset length 117263
+        batch_size=16,
+        accumulate=1,
+        multi_scale=False,
+        freeze_backbone=False,
+        num_workers=4,
+        transfer=False  # Transfer learning (train only YOLO layers)
 
-random.seed(0)
-np.random.seed(0)
-torch.manual_seed(0)
-if cuda:
-    torch.cuda.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
-    torch.backends.cudnn.benchmark = True
+):
+    weights = 'weights' + os.sep
+    latest = weights + 'latest.pt'
+    best = weights + 'best.pt'
+    device = torch_utils.select_device()
 
-
-def main(opt):
-    os.makedirs('checkpoints', exist_ok=True)
+    if multi_scale:
+        img_size = 608  # initiate with maximum multi_scale size
+        num_workers = 0  # bug https://github.com/ultralytics/yolov3/issues/174
+    else:
+        torch.backends.cudnn.benchmark = True  # unsuitable for multiscale
 
     # Configure run
-    data_config = parse_data_config(opt.data_config_path)
-    num_classes = int(data_config['classes'])
-    if platform == 'darwin':  # MacOS (local)
-        train_path = data_config['train']
-    else:  # linux (cloud, i.e. gcp)
-        train_path = '../coco/trainvalno5k.part'
+    train_path = parse_data_cfg(data_cfg)['train']
 
     # Initialize model
-    model = Darknet(opt.cfg, opt.img_size)
+    model = Darknet(cfg, img_size).to(device)
 
-    # Get dataloader
-    dataloader = load_images_and_labels(train_path, batch_size=opt.batch_size, img_size=opt.img_size, augment=True)
+    # Optimizer
+    lr0 = 0.001  # initial learning rate
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr0, momentum=0.9, weight_decay=0.0005)
 
-    # reload saved optimizer state
+    cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
     best_loss = float('inf')
-    if opt.resume:
-        checkpoint = torch.load('checkpoints/latest.pt', map_location='cpu')
+    nf = int(model.module_defs[model.yolo_layers[0] - 1]['filters'])  # yolo layer size (i.e. 255)
 
-        model.load_state_dict(checkpoint['model'])
-        if torch.cuda.device_count() > 1:
-            print('Using ', torch.cuda.device_count(), ' GPUs')
-            model = nn.DataParallel(model)
-        model.to(device).train()
+    if resume:  # Load previously saved model
+        if transfer:  # Transfer learning
+            chkpt = torch.load(weights + 'yolov3.pt', map_location=device)
+            model.load_state_dict({k: v for k, v in chkpt['model'].items() if v.numel() > 1 and v.shape[0] != 255},
+                                  strict=False)
+            for p in model.parameters():
+                p.requires_grad = True if p.shape[0] == nf else False
 
-        # # Transfer learning
-        # for i, (name, p) in enumerate(model.named_parameters()):
-        #     #name = name.replace('module_list.', '')
-        #     #print('%4g %70s %9s %12g %20s %12g %12g' % (
-        #     #    i, name, p.requires_grad, p.numel(), list(p.shape), p.mean(), p.std()))
-        #     if p.shape[0] != 650:  # not YOLO layer
-        #         p.requires_grad = False
+        else:  # resume from latest.pt
+            chkpt = torch.load(latest, map_location=device)  # load checkpoint
+            model.load_state_dict(chkpt['model'])
 
-        # Set optimizer
-        # optimizer = torch.optim.SGD(model.parameters(), lr=.001, momentum=.9, weight_decay=5e-4, nesterov=True)
-        # optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()))
-        optimizer = torch.optim.Adam(model.parameters())
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = chkpt['epoch'] + 1
+        if chkpt['optimizer'] is not None:
+            optimizer.load_state_dict(chkpt['optimizer'])
+            best_loss = chkpt['best_loss']
+        del chkpt
 
-        start_epoch = checkpoint['epoch'] + 1
-        best_loss = checkpoint['best_loss']
+    else:  # Initialize model with backbone (optional)
+        if '-tiny.cfg' in cfg:
+            cutoff = load_darknet_weights(model, weights + 'yolov3-tiny.conv.15')
+        else:
+            cutoff = load_darknet_weights(model, weights + 'darknet53.conv.74')
 
-        del checkpoint  # current, saved
+    # Set scheduler (reduce lr at epochs 218, 245, i.e. batches 400k, 450k)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[218, 245], gamma=0.1,
+                                                     last_epoch=start_epoch - 1)
+
+    # Dataset
+    dataset = LoadImagesAndLabels(train_path, img_size=img_size, augment=True)
+
+    # Initialize distributed training
+    if torch.cuda.device_count() > 1:
+        dist.init_process_group(backend=opt.backend, init_method=opt.dist_url, world_size=opt.world_size, rank=opt.rank)
+        model = torch.nn.parallel.DistributedDataParallel(model)
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     else:
-        if torch.cuda.device_count() > 1:
-            print('Using ', torch.cuda.device_count(), ' GPUs')
-            model = nn.DataParallel(model)
-        model.to(device).train()
-        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=5e-4)
+        sampler = None
 
-    # Set scheduler
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 24, eta_min=0.00001, last_epoch=-1)
-    # y = 0.001 * exp(-0.00921 * x)  # 1e-4 @ 250, 1e-5 @ 500
-    # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99082, last_epoch=start_epoch - 1)
+    # Dataloader
+    dataloader = DataLoader(dataset,
+                            batch_size=batch_size,
+                            num_workers=num_workers,
+                            shuffle=False,
+                            pin_memory=False,
+                            collate_fn=dataset.collate_fn,
+                            sampler=sampler)
 
-    modelinfo(model)
-    t0, t1 = time.time(), time.time()
-    print('%10s' * 16 % (
-        'Epoch', 'Batch', 'x', 'y', 'w', 'h', 'conf', 'cls', 'total', 'P', 'R', 'nGT', 'TP', 'FP', 'FN', 'time'))
-    for epoch in range(opt.epochs):
-        epoch += start_epoch
-
-        # Multi-Scale Training
-        # img_size = random.choice(range(10, 20)) * 32
-        # dataloader = load_images_and_labels(train_path, batch_size=opt.batch_size, img_size=img_size, augment=True)
-        # print('Running this epoch with image size %g' % img_size)
+    # Start training
+    t = time.time()
+    model_info(model)
+    nB = len(dataloader)
+    n_burnin = min(round(nB / 5 + 1), 1000)  # burn-in batches
+    os.remove('train_batch0.jpg') if os.path.exists('train_batch0.jpg') else None
+    os.remove('test_batch0.jpg') if os.path.exists('test_batch0.jpg') else None
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        print(('\n%8s%12s' + '%10s' * 7) % ('Epoch', 'Batch', 'xy', 'wh', 'conf', 'cls', 'total', 'nTargets', 'time'))
 
         # Update scheduler
-        # if epoch % 25 == 0:
-        #     scheduler.last_epoch = -1  # for cosine annealing, restart every 25 epochs
-        # scheduler.step()
-        # if epoch <= 100:
-        # for g in optimizer.param_groups:
-        # g['lr'] = 0.0005 * (0.992 ** epoch)  # 1/10 th every 250 epochs
-        # g['lr'] = 0.001 * (0.9773 ** epoch)  # 1/10 th every 100 epochs
-        # g['lr'] = 0.0005 * (0.955 ** epoch)  # 1/10 th every 50 epochs
-        # g['lr'] = 0.0005 * (0.926 ** epoch)  # 1/10 th every 30 epochs
+        scheduler.step()
 
-        ui = -1
-        rloss = defaultdict(float)  # running loss
-        metrics = torch.zeros(4, num_classes)
-        for i, (imgs, targets) in enumerate(dataloader):
+        # Freeze backbone at epoch 0, unfreeze at epoch 1
+        if freeze_backbone and epoch < 2:
+            for name, p in model.named_parameters():
+                if int(name.split('.')[1]) < cutoff:  # if layer < 75
+                    p.requires_grad = False if epoch == 0 else True
 
-            n = opt.batch_size  # number of pictures at a time
-            for j in range(int(len(imgs) / n)):
-                targets_j = targets[j * n:j * n + n]
-                nGT = sum([len(x) for x in targets_j])
-                if nGT < 1:
-                    continue
+        mloss = defaultdict(float)  # mean loss
+        for i, (imgs, targets, _, _) in enumerate(dataloader):
+            imgs = imgs.to(device)
+            targets = targets.to(device)
 
-                loss = model(imgs[j * n:j * n + n].to(device), targets_j, requestPrecision=True, epoch=epoch)
-                optimizer.zero_grad()
-                loss.backward()
+            nt = len(targets)
+            if nt == 0:  # if no targets continue
+                continue
+
+            # Plot images with bounding boxes
+            if epoch == 0 and i == 0:
+                plot_images(imgs=imgs, targets=targets, fname='train_batch0.jpg')
+
+            # SGD burn-in
+            if epoch == 0 and i <= n_burnin:
+                lr = lr0 * (i / n_burnin) ** 4
+                for x in optimizer.param_groups:
+                    x['lr'] = lr
+
+            # Run model
+            pred = model(imgs)
+
+            # Build targets
+            target_list = build_targets(model, targets)
+
+            # Compute loss
+            loss, loss_dict = compute_loss(pred, target_list)
+
+            # Compute gradient
+            loss.backward()
+
+            # Accumulate gradient for x batches before optimizing
+            if (i + 1) % accumulate == 0 or (i + 1) == nB:
                 optimizer.step()
+                optimizer.zero_grad()
 
-                ui += 1
-                metrics += model.losses['metrics']
-                for key, val in model.losses.items():
-                    rloss[key] = (rloss[key] * ui + val) / (ui + 1)
+            # Running epoch-means of tracked metrics
+            for key, val in loss_dict.items():
+                mloss[key] = (mloss[key] * i + val) / (i + 1)
 
-                # Precision
-                precision = metrics[0] / (metrics[0] + metrics[1] + 1e-16)
-                k = (metrics[0] + metrics[1]) > 0
-                if k.sum() > 0:
-                    mean_precision = precision[k].mean()
-                else:
-                    mean_precision = 0
+            s = ('%8s%12s' + '%10.3g' * 7) % (
+                '%g/%g' % (epoch, epochs - 1), '%g/%g' % (i, nB - 1),
+                mloss['xy'], mloss['wh'], mloss['conf'], mloss['cls'],
+                mloss['total'], nt, time.time() - t)
+            t = time.time()
+            print(s)
 
-                # Recall
-                recall = metrics[0] / (metrics[0] + metrics[2] + 1e-16)
-                k = (metrics[0] + metrics[2]) > 0
-                if k.sum() > 0:
-                    mean_recall = recall[k].mean()
-                else:
-                    mean_recall = 0
+            # Multi-Scale training (320 - 608 pixels) every 10 batches
+            if multi_scale and (i + 1) % 10 == 0:
+                dataset.img_size = random.choice(range(10, 20)) * 32
+                print('multi_scale img_size = %g' % dataset.img_size)
 
-                s = ('%10s%10s' + '%10.3g' * 14) % (
-                    '%g/%g' % (epoch, opt.epochs - 1), '%g/%g' % (i, len(dataloader) - 1), rloss['x'],
-                    rloss['y'], rloss['w'], rloss['h'], rloss['conf'], rloss['cls'],
-                    rloss['loss'], mean_precision, mean_recall, model.losses['nGT'], model.losses['TP'],
-                    model.losses['FP'], model.losses['FN'], time.time() - t1)
-                t1 = time.time()
-                print(s)
-
-            # if i == 1:
-            #    return
+        # Calculate mAP
+        with torch.no_grad():
+            results = test.test(cfg, data_cfg, batch_size=batch_size, img_size=img_size, model=model)
 
         # Write epoch results
         with open('results.txt', 'a') as file:
-            file.write(s + '\n')
+            file.write(s + '%11.3g' * 5 % results + '\n')  # P, R, mAP, F1, test_loss
 
         # Update best loss
-        loss_per_target = rloss['loss'] / rloss['nGT']
-        if loss_per_target < best_loss:
-            best_loss = loss_per_target
+        test_loss = results[4]
+        if test_loss < best_loss:
+            best_loss = test_loss
 
-        # Save latest checkpoint
-        checkpoint = {'epoch': epoch,
-                      'best_loss': best_loss,
-                      'model': model.state_dict(),
-                      'optimizer': optimizer.state_dict()}
-        torch.save(checkpoint, 'checkpoints/latest.pt')
+        # Save training results
+        save = True and not opt.nosave
+        if save:
+            # Create checkpoint
+            chkpt = {'epoch': epoch,
+                     'best_loss': best_loss,
+                     'model': model.module.state_dict() if type(
+                         model) is nn.parallel.DistributedDataParallel else model.state_dict(),
+                     'optimizer': optimizer.state_dict()}
 
-        # Save best checkpoint
-        if best_loss == loss_per_target:
-            os.system('cp checkpoints/latest.pt checkpoints/best.pt')
+            # Save latest checkpoint
+            torch.save(chkpt, latest)
 
-        # Save backup checkpoint
-        if (epoch > 0) & (epoch % 5 == 0):
-            os.system('cp checkpoints/latest.pt checkpoints/backup' + str(epoch) + '.pt')
+            # Save best checkpoint
+            if best_loss == test_loss:
+                torch.save(chkpt, best)
 
-    # Save final model
-    dt = time.time() - t0
-    print('Finished %g epochs in %.2fs (%.2fs/epoch)' % (epoch, dt, dt / (epoch + 1)))
+            # Save backup every 10 epochs (optional)
+            if epoch > 0 and epoch % 10 == 0:
+                torch.save(chkpt, weights + 'backup%g.pt' % epoch)
+
+            # Delete checkpoint
+            del chkpt
 
 
 if __name__ == '__main__':
-    torch.cuda.empty_cache()
-    main(opt)
-    torch.cuda.empty_cache()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=273, help='number of epochs')
+    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
+    parser.add_argument('--accumulate', type=int, default=1, help='accumulate gradient x batches before optimizing')
+    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='cfg file path')
+    parser.add_argument('--data-cfg', type=str, default='data/coco.data', help='coco.data file path')
+    parser.add_argument('--multi-scale', action='store_true', help='random image sizes per batch 320 - 608')
+    parser.add_argument('--img-size', type=int, default=416, help='pixels')
+    parser.add_argument('--resume', action='store_true', help='resume training flag')
+    parser.add_argument('--transfer', action='store_true', help='transfer learning flag')
+    parser.add_argument('--num-workers', type=int, default=4, help='number of Pytorch DataLoader workers')
+    parser.add_argument('--dist-url', default='tcp://127.0.0.1:9999', type=str, help='distributed training init method')
+    parser.add_argument('--rank', default=0, type=int, help='distributed training node rank')
+    parser.add_argument('--world-size', default=1, type=int, help='number of nodes for distributed training')
+    parser.add_argument('--backend', default='nccl', type=str, help='distributed backend')
+    parser.add_argument('--nosave', action='store_true', help='do not save training results')
+    opt = parser.parse_args()
+    print(opt, end='\n\n')
+
+    init_seeds()
+
+    train(
+        opt.cfg,
+        opt.data_cfg,
+        img_size=opt.img_size,
+        resume=opt.resume or opt.transfer,
+        transfer=opt.transfer,
+        epochs=opt.epochs,
+        batch_size=opt.batch_size,
+        accumulate=opt.accumulate,
+        multi_scale=opt.multi_scale,
+        num_workers=opt.num_workers
+    )

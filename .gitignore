@@ -8,19 +8,40 @@
 *.PNG
 *.TIF
 *.HEIC
-*.weights
-*.pt
-!zidane_result.jpg
-!coco_training_loss.png
-!coco_augmentation_examples.jpg
+*.mp4
+*.mov
+*.MOV
+*.avi
+*.data
+*.json
 
-results.txt
-temp-plot.html
+*.cfg
+!cfg/yolov3*.cfg
+
+data/*
+!data/samples/zidane.jpg
+!data/coco.names
+!data/coco_paper.names
+!data/coco.data
+!data/coco_1*.data
+!data/coco_1*.txt
+
+pycocotools/*
+results*.txt
+gcp_test*.sh
 
 # MATLAB GitIgnore -----------------------------------------------------------------------------------------------------
 *.m~
 *.mat
 !targets*.mat
+
+# Neural Network weights -----------------------------------------------------------------------------------------------
+*.weights
+*.pt
+*.onnx
+*.mlmodel
+darknet53.conv.74
+yolov3-tiny.conv.15
 
 # GitHub Python GitIgnore ----------------------------------------------------------------------------------------------
 # Byte-compiled / optimized / DLL files
